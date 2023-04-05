@@ -1,8 +1,6 @@
 //General
-const process = require('process');
 require('dotenv').config();
 const moment = require('moment');
-
 
 // Discord 
 const { Client, Events, GatewayIntentBits } = require('discord.js');
@@ -11,9 +9,11 @@ const token = process.env.DISCORD_TOKEN;
 
 //Google
 const { google } = require('googleapis');
-const { privateDecrypt } = require('crypto');
-const { Console } = require('console');
 const calendar = google.calendar('v3');
+
+//Custom modules
+const scheduledb = require('./schedule-modules/db.js');
+const db = scheduledb.initialize();
 
 const SCOPES = ['https://www.googleapis.com/auth/calendar'];
 const GOOGLE_CALENDAR_ID = process.env.calendar_id;
@@ -25,9 +25,10 @@ const auth = new google.auth.GoogleAuth({
 // When the client is ready, run this code (only once)
 client.once(Events.ClientReady, () => {
     console.log(`Ready! Logged in as ${client.user.tag}`);
-
+    
     checkEvents();
 });
+
 
 // Log in to Discord with your client's token
 client.login(token);
@@ -57,15 +58,16 @@ async function listEvents() {
 async function checkEvents() {
     console.log("Checking events in calendar");
     const events = await listEvents();
-    const newEvents = [];
-    const existingEvents = [];
+    
 
-    client.guilds.cache.forEach(guild => {
+    client.guilds.cache.forEach((guild) => {
+        const newEvents = [];
+        const existingEvents = [];
 
         console.log(`Processing events ${events.length} for guild ${guild.id}`)
         for (const event of events) {
             //Lord have mercy
-            if (event.hasOwnProperty('extendedProperties') && event.extendedProperties.hasOwnProperty('private') && event.extendedProperties.private.hasOwnProperty(guild.id)) {
+            if (scheduledb.googleEventExistsInDiscord(event.id,guild.id,db)) {
                 existingEvents.push(event)
             } else {
                 newEvents.push(event)
@@ -75,9 +77,10 @@ async function checkEvents() {
 
         createEvents(newEvents, guild);
         updateEvents(existingEvents,guild);
+        cleanupEvents(guild);
     });
 
-    setTimeout(checkEvents, 1000 * 10);
+    setTimeout(checkEvents, 1000 * 60);
 }
 
 function createEvents(events, guild) {
@@ -92,20 +95,9 @@ function createEvents(events, guild) {
             privacyLevel: 2 //Only valid value
         }
         try {
+            console.log("")
             const discordEvent = await guild.scheduledEvents.create(discordEventData);
-            const extendedProperties = {
-                private: {
-                    [guild.id]: discordEvent.id
-                }
-            };
-            const googleEventData = {
-                eventId: event.id,
-                calendarId: GOOGLE_CALENDAR_ID,
-                resource: {
-                    extendedProperties: extendedProperties
-                }
-            }
-            await calendar.events.patch(googleEventData);
+            scheduledb.addEvent(discordEvent.id,event.id,guild.id,formatDatetime(event.end).toISOString(),db);
         } catch (error) {
             console.error("There was an error in creating the Discord event:", error)
         }
@@ -113,8 +105,9 @@ function createEvents(events, guild) {
 }
 
 function updateEvents(events, guild) {
+    //Check each event for changes in the relevant values
     events.forEach(async (event) => {
-        const discordEvent = guild.scheduledEvents.cache.get(event.extendedProperties.private[guild.id]);
+        const discordEvent = guild.scheduledEvents.cache.get(scheduledb.getDiscordId(event.id,guild.id,db));
         if(discordEvent) {
             const updatedEvent = {};
             if(event.summary != discordEvent.name) {
@@ -125,6 +118,7 @@ function updateEvents(events, guild) {
             }
             if(formatDatetime(event.end).getTime() != discordEvent.scheduledEndTimestamp) {
                 updatedEvent['scheduledEndTime'] = formatDatetime(event.end);
+                scheduledb.updateEndTimestamp(formatDatetime(event.end).toISOString(),discordEvent.id,guild.id,db);
             }
             if(event.description != discordEvent.description) {
                 updatedEvent['description'] = event.description;
@@ -134,8 +128,28 @@ function updateEvents(events, guild) {
                 await guild.scheduledEvents.edit(discordEvent,updatedEvent)
             }
         }
-
     })
+}
+
+function cleanupEvents(guild) {
+    //Cleanup database for any events that are past the current time
+    scheduledb.removeStaleEvents(new Date().toISOString(),db);
+    //Check if Calendarevent exists, if not delete the event in discord
+    const guildEvents = scheduledb.getEventsForGuild(guild.id,db);
+    guildEvents.forEach(async (guildEvent) => {
+        const authClient = await auth.getClient();
+        google.options({ auth: authClient });
+        const res = await calendar.events.get({
+            calendarId: GOOGLE_CALENDAR_ID,
+            eventId: guildEvent.googleId,
+        });
+        if(res.data.status == "cancelled") {
+            console.log(`Deleting event ${guildEvent.discordId}!`)
+            const event = await guild.scheduledEvents.cache.get(guildEvent.discordId)
+            guild.scheduledEvents.delete(event)
+            scheduledb.removeDiscordEvent(guildEvent.discordId,guildEvent.guildId,db);
+        }
+    });
 }
 
 function formatDatetime(dateTime) {
